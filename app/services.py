@@ -1,0 +1,233 @@
+from typing import List
+from fastapi import UploadFile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_qdrant import Qdrant
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableParallel
+import tempfile
+import os
+from app.config import *
+
+# Initialize models
+embeddings = GoogleGenerativeAIEmbeddings(
+    model=EMBEDDING_MODEL,
+    google_api_key=GOOGLE_API_KEY
+)
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",
+    google_api_key=GOOGLE_API_KEY,
+    temperature=0
+)
+
+# System prompt
+SYSTEM_PROMPT = """You are a resume matching expert. Analyze each resume against the job description.
+
+The context below contains multiple resumes, each clearly marked with "RESUME:" followed by the filename.
+
+For each resume, provide analysis in this exact structured format:
+
+### [Candidate Name] | [filename]
+**Match Score:** ⭐⭐⭐⭐⭐ [X/5 stars based on percentage]
+**Percentage Match:** [X]%
+**Status:** [[Strong Match/Moderate Match/Weak Match/No Match]]
+**Contact Info:** [email/phone if available]
+**Experience:** [X years]
+**Current/Most Recent Role:** [role at company]
+
+**Key Skills Match:**
+✓ [matched skill 1]
+✓ [matched skill 2]
+✗ [missing skill 1]
+✗ [missing skill 2]
+
+**Strengths:**
+- [strength 1]
+- [strength 2]
+
+**Areas for Concern:**
+- [concern 1]
+- [concern 2]
+
+# **Recommendation:** [Brief hiring recommendation]
+
+---
+
+Job Description: {question}
+
+Context: {context}
+
+Important Notes:
+1. Always use this exact format for each resume
+2. Include all sections even if some say "Not available"
+3. Use clear markdown formatting with ###, **, ✓, ✗ symbols
+4. Separate each resume analysis with ---
+"""
+
+prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
+
+def process_pdfs(files: List[UploadFile]):
+    """Process multiple PDF files while maintaining document boundaries."""
+    all_docs = []
+    
+    for file in files:
+        if not file.filename.lower().endswith('.pdf'):
+            continue
+            
+        try:
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(file.file.read())
+                temp_path = temp_file.name
+            
+            # Load PDF
+            loader = PyPDFLoader(temp_path)
+            docs = loader.load()
+            
+            # Combine all pages of this resume into a single document
+            full_resume_content = "\n\n".join([doc.page_content for doc in docs])
+            
+            # Create a single document for the entire resume with metadata
+            resume_doc = docs[0]  # Use first page as base
+            resume_doc.page_content = f"RESUME: {file.filename}\n\n{full_resume_content}"
+            resume_doc.metadata.update({
+                'source': file.filename,
+                'resume_name': file.filename,
+                'document_type': 'resume'
+            })
+            
+            # Now split this complete resume into chunks if it's too large
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP
+            )
+            
+            # Only split if the resume is larger than chunk size
+            if len(resume_doc.page_content) > CHUNK_SIZE:
+                split_docs = text_splitter.split_documents([resume_doc])
+                # Ensure each chunk retains the resume identifier
+                for chunk in split_docs:
+                    if not chunk.page_content.startswith("RESUME:"):
+                        chunk.page_content = f"RESUME: {file.filename}\n\n{chunk.page_content}"
+                    chunk.metadata.update({
+                        'source': file.filename,
+                        'resume_name': file.filename,
+                        'document_type': 'resume'
+                    })
+                all_docs.extend(split_docs)
+            else:
+                all_docs.append(resume_doc)
+            
+            # Clean up
+            os.unlink(temp_path)
+            
+        except Exception as e:
+            print(f"Error processing {file.filename}: {str(e)}")
+    
+    if all_docs:
+        # Store all documents in Qdrant
+        Qdrant.from_documents(
+            documents=all_docs,
+            embedding=embeddings,
+            url=QDRANT_URL,
+            collection_name=COLLECTION_NAME,
+        )
+    
+    return len(all_docs)
+
+def get_retriever():
+    """Get the retriever for the PDF collection"""
+    return Qdrant.from_existing_collection(
+        embedding=embeddings,
+        url=QDRANT_URL,
+        collection_name=COLLECTION_NAME
+    )
+
+def ask_question_service(question: str):
+    """Ask a question using RAG on the processed PDFs"""
+    retriever = get_retriever()
+    
+    print(f"Retrieving context for question: {question}")
+    # Create RAG chain
+    rag_chain = (
+        RunnableParallel({
+            "context": retriever.as_retriever(search_kwargs={"k": 10}) | RunnableLambda(format_docs),
+            "question": RunnablePassthrough()
+        })
+        | prompt
+        | llm
+    )
+    
+    result = rag_chain.invoke(question)
+    return result.content
+
+def format_docs(docs):
+    """Convert documents to a single string while preserving resume boundaries"""
+    formatted_docs = []
+    seen_resumes = set()
+    
+    for doc in docs:
+        resume_name = doc.metadata.get('resume_name', 'Unknown')
+        
+        # If this is a new resume, add a clear separator
+        if resume_name not in seen_resumes:
+            if seen_resumes:  # Not the first resume
+                formatted_docs.append("\n" + "="*50 + "\n")
+            seen_resumes.add(resume_name)
+        
+        formatted_docs.append(doc.page_content)
+    
+    return "\n\n".join(formatted_docs)
+
+def get_processed_resumes():
+    """Get list of all processed resumes"""
+    try:
+        retriever = get_retriever()
+        # Get all documents to extract resume names
+        all_docs = retriever.as_retriever(search_kwargs={"k": 100}).get_relevant_documents("*")
+        
+        resume_names = set()
+        for doc in all_docs:
+            if 'resume_name' in doc.metadata:
+                resume_names.add(doc.metadata['resume_name'])
+        
+        return list(resume_names)
+    except Exception as e:
+        return []
+
+def analyze_specific_resume(resume_name: str, job_description: str):
+    """Analyze a specific resume against a job description"""
+    try:
+        retriever = get_retriever()
+        
+        # Search for documents from specific resume
+        docs = retriever.as_retriever(
+            search_kwargs={
+                "k": 5,
+                "filter": {"resume_name": resume_name}
+            }
+        ).get_relevant_documents(job_description)
+        
+        if not docs:
+            return None
+        
+        context = format_docs(docs)
+        
+        # Create focused analysis chain
+        focused_chain = (
+            prompt | llm
+        )
+        
+        result = focused_chain.invoke({
+            "context": context,
+            "question": job_description
+        })
+        
+        return result.content
+        
+    except Exception as e:
+        return None
