@@ -21,7 +21,7 @@ embeddings = GoogleGenerativeAIEmbeddings(
 llm = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
     google_api_key=GOOGLE_API_KEY,
-    temperature=0
+    temperature=0.3
 )
 
 # System prompt
@@ -155,7 +155,7 @@ def ask_question_service(question: str):
     # Create RAG chain
     rag_chain = (
         RunnableParallel({
-            "context": retriever.as_retriever(search_kwargs={"k": 10}) | RunnableLambda(format_docs),
+            "context": retriever.as_retriever(search_kwargs={"k": 10000}) | RunnableLambda(format_docs),
             "question": RunnablePassthrough()
         })
         | prompt

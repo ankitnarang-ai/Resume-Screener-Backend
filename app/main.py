@@ -22,6 +22,7 @@ class QuestionRequest(BaseModel):
 @app.post("/upload-and-process/")
 async def upload_and_process(files: List[UploadFile] = File(...)):
     """Upload and process multiple PDF files for RAG"""
+    print("Received files for processing:", [file.filename for file in files])
     num_chunks = process_pdfs(files)
     return {"message": f"Processed PDFs into {num_chunks} chunks", "collection": "multi_pdf_rag"}
 
