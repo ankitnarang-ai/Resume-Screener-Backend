@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables import RunnableParallel
+from qdrant_client import QdrantClient
 import tempfile
 import os
 from app.config import *
@@ -70,9 +71,20 @@ Important Notes:
 
 prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
 
+def clear_qdrant_collection():
+    client = QdrantClient(url=QDRANT_URL)
+    try:
+        client.delete_collection(collection_name=COLLECTION_NAME)
+        print("collection deleted")
+    except Exception as e:
+        print(e)
+
 def process_pdfs(files: List[UploadFile]):
     """Process multiple PDF files while maintaining document boundaries."""
     all_docs = []
+
+    # Clear existing collection
+    clear_qdrant_collection()
     
     for file in files:
         if not file.filename.lower().endswith('.pdf'):
