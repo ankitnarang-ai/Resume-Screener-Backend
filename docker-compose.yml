@@ -17,9 +17,9 @@ services:
       context: .                         # uses the Dockerfile you just fixed
     ports:
       - "8000:8000"                      # host → container
-    environment:
-      QDRANT_URL: http://qdrant:6333     # ← service name, *not* localhost
-      QDRANT_API_KEY: ""                 # if you need a key, set here
+    # environment:
+    #   QDRANT_URL: https://ae88571d-4265-4a4d-b3c8-4ebd97fa1f36.europe-west3-0.gcp.cloud.qdrant.io:6333
+    #   QDRANT_API_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.hSE-DMHbdwRqQwKhAoZY2aN43WtWOnn1tO6109wGmR0             # if you need a key, set here
     depends_on:
       - qdrant                           # start DB first
 

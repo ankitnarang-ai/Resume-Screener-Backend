@@ -72,7 +72,11 @@ Important Notes:
 prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
 
 def clear_qdrant_collection():
-    client = QdrantClient(url=QDRANT_URL)
+    client = QdrantClient(
+    url=QDRANT_URL,               # From environment variables
+    api_key=QDRANT_API_KEY,       # New requirement for cloud
+    prefer_grpc=True             # Better performance for cloud
+)
     try:
         client.delete_collection(collection_name=COLLECTION_NAME)
         print("collection deleted")
