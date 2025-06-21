@@ -1,0 +1,27 @@
+# services: 
+#   qdrant:
+#     image: qdrant/qdrant
+#     ports:
+#       - "6333:6333"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest          # official image
+    ports:
+      - "6333:6333"                      # host → container
+    volumes:
+      - qdrant_data:/qdrant/storage      # keep vectors after restarts
+
+  backend:
+    build:
+      context: .                         # uses the Dockerfile you just fixed
+    ports:
+      - "8000:8000"                      # host → container
+    environment:
+      QDRANT_URL: http://qdrant:6333     # ← service name, *not* localhost
+      QDRANT_API_KEY: ""                 # if you need a key, set here
+    depends_on:
+      - qdrant                           # start DB first
+
+volumes:
+  qdrant_data:                           # named volume definition

@@ -44,4 +44,13 @@ typing-inspection==0.4.1
 typing_extensions==4.14.0
 urllib3==2.4.0
 yarl==1.20.1
+uvicorn[standard]
 zstandard==0.23.0
+fastapi
+qdrant-client
+google-generativeai
+langchain_qdrant
+langchain_google_genai 
+python-multipart
+
+
