@@ -46,14 +46,14 @@ Output Rules:
 Output Format Examples:
 
 HR requests strong matches:
-- Strong Match: [Candidate Name] | [filename]
+- Strong Match: [Candidate Name] | [filename] | [emailId]
 ---
-- Strong Match: [Candidate Name] | [filename]
+- Strong Match: [Candidate Name] | [filename] | [emailId]
 
 HR requests moderate matches:
-- Strong Match: [Candidate Name] | [filename]
+- Strong Match: [Candidate Name] | [filename] | [emailId]
 ---
-- Moderate Match: [Candidate Name] | [filename]
+- Moderate Match: [Candidate Name] | [filename] | [emailId]
 
 Absolute Requirements:
 1. NEVER add explanations or free text
