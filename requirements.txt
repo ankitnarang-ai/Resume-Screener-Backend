@@ -52,5 +52,6 @@ google-generativeai
 langchain_qdrant
 langchain_google_genai 
 python-multipart
+PyPDF2
 
 
