@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 from typing import List
 from fastapi import UploadFile
 from langchain_community.document_loaders import PyPDFLoader
@@ -11,6 +13,9 @@ from langchain_core.runnables import RunnableParallel
 from qdrant_client import QdrantClient
 import tempfile
 import os
+import io
+import PyPDF2
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from app.config import *
 
 # Initialize models
@@ -67,92 +72,204 @@ Job Description Requirements: {question}
 Resumes to Analyze: {context}
 """
 
-
 prompt = ChatPromptTemplate.from_template(SYSTEM_PROMPT)
 
 def clear_qdrant_collection():
     client = QdrantClient(
-    url=QDRANT_URL,               # From environment variables
-    api_key=QDRANT_API_KEY,       # New requirement for cloud
-    prefer_grpc=True             # Better performance for cloud
-)
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+        prefer_grpc=True
+    )
     try:
         client.delete_collection(collection_name=COLLECTION_NAME)
         print("collection deleted")
     except Exception as e:
         print(e)
 
-def process_pdfs(files: List[UploadFile]):
-    """Process multiple PDF files while maintaining document boundaries."""
-    all_docs = []
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, filename: str) -> str:
+    """Extract text from PDF bytes without saving to temp file"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        text_content = []
+        
+        for page in pdf_reader.pages:
+            text_content.append(page.extract_text())
+        
+        return "\n\n".join(text_content)
+    except Exception as e:
+        print(f"Error extracting text from {filename}: {str(e)}")
+        return ""
 
-    # Clear existing collection
+# Means file data is of type tuple and return type is dictionary
+
+def process_single_pdf(file_data: tuple) -> dict:
+    """Process a single PDF file and return document data"""
+    filename, pdf_bytes = file_data
+
+    if not filename.lower().endswith('.pdf'):
+        return None
+    
+    try:
+        # Extract text directly from bytes
+        full_resume_content = extract_text_from_pdf_bytes(pdf_bytes, filename)
+        
+        if not full_resume_content.strip():
+            print(f"No text extracted from {filename}")
+            return None
+        
+        # Create document data
+        doc_data = {
+            'page_content': f"RESUME: {filename}\n\n{full_resume_content}",
+            'metadata': {
+                'source': filename,
+                'resume_name': filename,
+                'document_type': 'resume'
+            }
+        }
+        
+        return doc_data
+        
+    except Exception as e:
+        print(f"Error processing {filename}: {str(e)}")
+        return None
+
+def create_chunks_from_doc_data(doc_data: dict) -> List[dict]:
+    """Create chunks from document data if needed"""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    
+    chunks = []
+    
+    # Only split if the resume is larger than chunk size
+    if len(doc_data['page_content']) > CHUNK_SIZE:
+        # Split the content
+        split_texts = text_splitter.split_text(doc_data['page_content'])
+        
+        for i, chunk_text in enumerate(split_texts):
+            # Ensure each chunk retains the resume identifier
+            if not chunk_text.startswith("RESUME:"):
+                chunk_text = f"RESUME: {doc_data['metadata']['resume_name']}\n\n{chunk_text}"
+            
+            chunk_data = {
+                'page_content': chunk_text,
+                'metadata': {
+                    **doc_data['metadata'],
+                    'chunk_id': i
+                }
+            }
+            chunks.append(chunk_data)
+    else:
+        chunks.append(doc_data)
+    
+    return chunks
+
+async def process_pdfs(files: List[UploadFile]):
+    """Process multiple PDF files with high performance using async operations."""
+    
+    # Clear existing collection first
     clear_qdrant_collection()
     
+    if not files:
+        return 0
+        
+    # Read all files into memory first (async)
+    file_data_list = []
     for file in files:
-        if not file.filename.lower().endswith('.pdf'):
-            continue
-            
-        try:
-            # Save uploaded file temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                temp_file.write(file.file.read())
-                temp_path = temp_file.name
-            
-            # Load PDF
-            loader = PyPDFLoader(temp_path)
-            docs = loader.load()
-            
-            # Combine all pages of this resume into a single document
-            full_resume_content = "\n\n".join([doc.page_content for doc in docs])
-            
-            # Create a single document for the entire resume with metadata
-            resume_doc = docs[0]  # Use first page as base
-            resume_doc.page_content = f"RESUME: {file.filename}\n\n{full_resume_content}"
-            resume_doc.metadata.update({
-                'source': file.filename,
-                'resume_name': file.filename,
-                'document_type': 'resume'
-            })
-            
-            # Now split this complete resume into chunks if it's too large
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=CHUNK_SIZE,
-                chunk_overlap=CHUNK_OVERLAP
+        content = await file.read()
+        file_data_list.append((file.filename, content))
+        # Reset file pointer for potential reuse
+        await file.seek(0)
+    
+    print(f"Processing {len(file_data_list)} files...")
+    
+    # Process PDFs in parallel using ThreadPoolExecutor
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=min(32, len(file_data_list))) as executor:
+        # Submit all PDF processing tasks
+        future_to_filename = {
+            loop.run_in_executor(executor, process_single_pdf, file_data): file_data[0] 
+            for file_data in file_data_list
+        }
+        
+        # Collect results as they complete
+        doc_data_list = []
+        completed = 0
+        
+        for future in asyncio.as_completed(future_to_filename):
+            try:
+                doc_data = await future
+                if doc_data:
+                    doc_data_list.append(doc_data)
+                completed += 1
+                
+                # Progress indicator
+                if completed % 100 == 0:
+                    print(f"Processed {completed}/{len(file_data_list)} files...")
+                    
+            except Exception as e:
+                filename = future_to_filename[future]
+                print(f"Error processing {filename}: {str(e)}")
+    
+    print(f"Successfully processed {len(doc_data_list)} PDF files")
+    
+    if not doc_data_list:
+        return 0
+    
+    # Create chunks in parallel
+    print("Creating document chunks...")
+    with ThreadPoolExecutor(max_workers=min(16, len(doc_data_list))) as executor:
+        chunk_futures = [
+            loop.run_in_executor(executor, create_chunks_from_doc_data, doc_data)
+            for doc_data in doc_data_list
+        ]
+        
+        all_chunks = []
+        for future in asyncio.as_completed(chunk_futures):
+            chunks = await future
+            all_chunks.extend(chunks)
+    
+    print(f"Created {len(all_chunks)} document chunks")
+    
+    # Convert chunk data back to Document objects for Qdrant
+    from langchain_core.documents import Document
+    documents = []
+    for chunk_data in all_chunks:
+        doc = Document(
+            page_content=chunk_data['page_content'],
+            metadata=chunk_data['metadata']
+        )
+        documents.append(doc)
+    
+    # Store in Qdrant in batches for better performance
+    print("Storing documents in Qdrant...")
+    batch_size = 100  # Process in smaller batches to avoid memory issues
+    
+    try:
+        # Create collection with first batch
+        if documents:
+            first_batch = documents[:batch_size]
+            vectorstore = Qdrant.from_documents(
+                documents=first_batch,
+                embedding=embeddings,
+                url=QDRANT_URL,
+                collection_name=COLLECTION_NAME,
             )
             
-            # Only split if the resume is larger than chunk size
-            if len(resume_doc.page_content) > CHUNK_SIZE:
-                split_docs = text_splitter.split_documents([resume_doc])
-                # Ensure each chunk retains the resume identifier
-                for chunk in split_docs:
-                    if not chunk.page_content.startswith("RESUME:"):
-                        chunk.page_content = f"RESUME: {file.filename}\n\n{chunk.page_content}"
-                    chunk.metadata.update({
-                        'source': file.filename,
-                        'resume_name': file.filename,
-                        'document_type': 'resume'
-                    })
-                all_docs.extend(split_docs)
-            else:
-                all_docs.append(resume_doc)
-            
-            # Clean up
-            os.unlink(temp_path)
-            
-        except Exception as e:
-            print(f"Error processing {file.filename}: {str(e)}")
+            # Add remaining documents in batches
+            for i in range(batch_size, len(documents), batch_size):
+                batch = documents[i:i + batch_size]
+                vectorstore.add_documents(batch)
+                print(f"Stored batch {i//batch_size + 1}/{(len(documents) + batch_size - 1)//batch_size}")
+        
+        print(f"Successfully stored {len(documents)} documents in Qdrant")
+        
+    except Exception as e:
+        print(f"Error storing documents in Qdrant: {str(e)}")
+        return 0
     
-    if all_docs:
-        # Store all documents in Qdrant
-        Qdrant.from_documents(
-            documents=all_docs,
-            embedding=embeddings,
-            url=QDRANT_URL,
-            collection_name=COLLECTION_NAME,
-        )
-    
-    return len(all_docs)
+    return len(documents)
 
 def get_retriever():
     """Get the retriever for the PDF collection"""
