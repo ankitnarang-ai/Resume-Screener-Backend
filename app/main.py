@@ -1,12 +1,14 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
+from app.routes.api import router as api_router
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app.config import CORS_ORIGINS
-from app.services import process_pdfs, ask_question_service, get_processed_resumes, analyze_specific_resume
-
+from app.services.resume_services import process_pdfs, ask_question_service, get_processed_resumes, analyze_specific_resume
 #create instance of fast api
 app = FastAPI()
+
+app.include_router(api_router, prefix="/api")
 
 #cors to allow requests from frontend
 app.add_middleware(
