@@ -16,6 +16,8 @@ import os
 import io
 import PyPDF2
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import json
+import re
 from app.config import *
 
 # Initialize models
@@ -30,7 +32,7 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.3
 )
 
-# System prompt
+# Updated System prompt for JSON response
 SYSTEM_PROMPT = """You are an expert resume matching system designed to evaluate candidates against job requirements with precision. Analyze each resume strictly according to the specified matching criteria.
 
 Input Context:
@@ -42,30 +44,38 @@ Matching Criteria:
 2. Moderate Match: Candidate meets ≥70% of key requirements (including all critical ones)
 
 Output Rules:
-- Respond ONLY in the specified format
+- Respond ONLY in valid JSON format
 - Filter strictly based on the HR's selected match type
 - For 'strong' requests: return ONLY strong matches
 - For 'moderate' requests: return both strong and moderate matches
-- If no matches exist, state "No resumes match the job description."
+- If no matches exist, return empty arrays
 
-Output Format Examples:
+JSON Output Format:
+{{
+    "matches": [
+        {{
+            "name": "John Doe",
+            "filename": "john_doe_resume.pdf",
+            "email": "john.doe@example.com"
+        }},
+        {{
+            "name": "Jane Smith",
+            "filename": "jane_smith_resume.pdf",
+            "email": "jane.smith@example.com"
+        }}
+    ],
 
-HR requests strong matches:
-- Strong Match: [Candidate Name] | [filename] | [emailId]
----
-- Strong Match: [Candidate Name] | [filename] | [emailId]
-
-HR requests moderate matches:
-- Strong Match: [Candidate Name] | [filename] | [emailId]
----
-- Moderate Match: [Candidate Name] | [filename] | [emailId]
+    total : 2,
+}}
 
 Absolute Requirements:
-1. NEVER add explanations or free text
-2. NEVER repeat the same candidate
-3. STRICTLY follow the percentage thresholds
-4. ALWAYS use the exact format shown
-5. If HR asks for strong matches, NEVER include moderate matches
+1. ALWAYS return valid JSON
+2. NEVER add explanations outside JSON
+3. NEVER repeat the same candidate, ( Eg: if email is same, do not repeat)
+4. STRICTLY follow the percentage thresholds
+5. Extract email addresses from resumes when available
+6. Return ONLY name, email & filename for each matched candidate
+7. In total, return only the number of matches else 0
 
 Job Description Requirements: {question}
 
@@ -99,8 +109,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, filename: str) -> str:
     except Exception as e:
         print(f"Error extracting text from {filename}: {str(e)}")
         return ""
-
-# Means file data is of type tuple and return type is dictionary
 
 def process_single_pdf(file_data: tuple) -> dict:
     """Process a single PDF file and return document data"""
@@ -279,23 +287,54 @@ def get_retriever():
         collection_name=COLLECTION_NAME
     )
 
-def ask_question_service(question: str):
-    """Ask a question using RAG on the processed PDFs"""
-    retriever = get_retriever()
-    
-    print(f"Retrieving context for question: {question}")
-    # Create RAG chain
-    rag_chain = (
-        RunnableParallel({
-            "context": retriever.as_retriever(search_kwargs={"k": 10000}) | RunnableLambda(format_docs),
-            "question": RunnablePassthrough()
-        })
-        | prompt
-        | llm
-    )
-    
-    result = rag_chain.invoke(question)
-    return result.content
+def parse_json_response(response_text: str) -> dict:
+    """Parse JSON response from LLM, handling potential formatting issues"""
+    try:
+        # Try to parse as-is first
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        # Try to extract JSON from response if it's wrapped in text
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        # If all else fails, return error structure
+        return {
+            "error": "Failed to parse JSON response",
+            "raw_response": response_text,
+            "matches": []
+        }
+
+def ask_question_service(question: str) -> dict:
+    """Ask a question using RAG on the processed PDFs and return JSON response"""
+    try:
+        retriever = get_retriever()
+        
+        print(f"Retrieving context for question: {question}")
+        # Create RAG chain
+        rag_chain = (
+            RunnableParallel({
+                "context": retriever.as_retriever(search_kwargs={"k": 10000}) | RunnableLambda(format_docs),
+                "question": RunnablePassthrough()
+            })
+            | prompt
+            | llm
+        )
+        
+        result = rag_chain.invoke(question)
+        
+        # Parse the JSON response
+        json_response = parse_json_response(result.content)
+        return json_response
+        
+    except Exception as e:
+        return {
+            "error": f"Service error: {str(e)}",
+            "matches": []
+        }
 
 def format_docs(docs):
     """Convert documents to a single string while preserving resume boundaries"""
@@ -315,8 +354,8 @@ def format_docs(docs):
     
     return "\n\n".join(formatted_docs)
 
-def get_processed_resumes():
-    """Get list of all processed resumes"""
+def get_processed_resumes() -> dict:
+    """Get list of all processed resumes in JSON format"""
     try:
         retriever = get_retriever()
         # Get all documents to extract resume names
@@ -327,12 +366,21 @@ def get_processed_resumes():
             if 'resume_name' in doc.metadata:
                 resume_names.add(doc.metadata['resume_name'])
         
-        return list(resume_names)
+        return {
+            "status": "success",
+            "total_resumes": len(resume_names),
+            "resumes": list(resume_names)
+        }
     except Exception as e:
-        return []
+        return {
+            "status": "error",
+            "error": str(e),
+            "total_resumes": 0,
+            "resumes": []
+        }
 
-def analyze_specific_resume(resume_name: str, job_description: str):
-    """Analyze a specific resume against a job description"""
+def analyze_specific_resume(resume_name: str, job_description: str) -> dict:
+    """Analyze a specific resume against a job description and return JSON response"""
     try:
         retriever = get_retriever()
         
@@ -345,7 +393,11 @@ def analyze_specific_resume(resume_name: str, job_description: str):
         ).get_relevant_documents(job_description)
         
         if not docs:
-            return None
+            return {
+                "status": "error",
+                "error": f"Resume '{resume_name}' not found",
+                "analysis": None
+            }
         
         context = format_docs(docs)
         
@@ -359,7 +411,19 @@ def analyze_specific_resume(resume_name: str, job_description: str):
             "question": job_description
         })
         
-        return result.content
+        # Parse the JSON response
+        json_response = parse_json_response(result.content)
+        
+        return {
+            "status": "success",
+            "resume_name": resume_name,
+            "analysis": json_response
+        }
         
     except Exception as e:
-        return None
+        return {
+            "status": "error",
+            "error": str(e),
+            "resume_name": resume_name,
+            "analysis": None
+        }
